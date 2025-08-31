@@ -137,3 +137,16 @@ def health():
         "collection": COMPANIES_COLL,
         "companies_estimated": companies.estimated_document_count(),
     }
+
+# ------------ test bilateral connection ----------- 
+from fastapi import Body
+from datetime import datetime
+
+ingest_coll = db.get_collection("ingest_logs")
+
+@app.post("/ingest")
+def ingest(payload: dict = Body(...)):
+    doc = {"received_at": datetime.utcnow(), "payload": payload}
+    res = ingest_coll.insert_one(doc)
+    return {"ok": True, "id": str(res.inserted_id)}
+
