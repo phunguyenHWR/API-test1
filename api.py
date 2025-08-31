@@ -1,9 +1,9 @@
 # api.py
 import os, re, json, uuid, pathlib
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Query, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
@@ -18,20 +18,17 @@ EXPORT_DIR = pathlib.Path(os.getenv("EXPORT_DIR", "/tmp/exports"))
 if not MONGO_URI:
     raise RuntimeError("MONGO_URI not set")
 
-# ----- DB -----
 client = MongoClient(MONGO_URI, server_api=ServerApi("1"), tls=True, tlsAllowInvalidCertificates=False)
 db = client[DB_NAME]
 companies = db[COMPANIES_COLL]
 
-# ----- App -----
-app = FastAPI(title="Company Export (root-only)", version="0.3")
+app = FastAPI(title="Company Export (root-only)", version="0.4")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"]
 )
 
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----- Shortcuts -----
 SHORTCUTS: Dict[str, str] = {
     "c": "Continental AG (Germany, Fed. Rep.) (NBB: CTTA Y)",
     "a": "Airbus SE (NBB: EADS Y)",
@@ -56,7 +53,6 @@ SHORTCUTS: Dict[str, str] = {
     "stm": "STMicroelectronics NV (NYS: STM)",
 }
 
-# ----- Helpers -----
 def anchored_ci_exact(s: str) -> Dict[str, Any]:
     s = (s or "").strip()
     return {"$regex": f"^{re.escape(s)}$", "$options": "i"}
@@ -68,21 +64,29 @@ def resolve_target(input_value: str) -> str:
     key = (input_value or "").strip().lower()
     return SHORTCUTS.get(key, input_value.strip())
 
-# ----- Routes -----
-
-@app.get("/")  # ROOT now performs the export
+@app.get("/")
 def export_at_root(
     request: Request,
-    export: str = Query(..., description="Shortcut (e.g., c,a,b,...) OR full company name")
-) -> FileResponse:
-    target_name = resolve_target(export)
+    export: Optional[str] = Query(None, description="Shortcut or full name (preferred)"),
+    c: Optional[str] = Query(None, description="Alias for 'export' for older clients"),
+    mode: str = Query("file", description="file|json|link (default file)")
+):
+    """
+    - Accepts ?export= or ?c=
+    - mode=file -> return attachment (application/octet-stream)
+    - mode=json -> inline JSON in body
+    - mode=link -> JSON {download_url: ...}
+    """
+    value = export or c
+    if not value:
+        raise HTTPException(status_code=400, detail="Missing query param 'export' (or 'c').")
 
+    target_name = resolve_target(value)
     projection = {
         "_id": 1, "name": 1, "country": 1, "industry": 1,
         "website": 1, "traded_as": 1, "number_of_employees": 1, "revenue": 1
     }
 
-    # exact (CI), then fallback contains
     docs: List[Dict[str, Any]] = list(
         companies.find({"name": anchored_ci_exact(target_name)}, projection).limit(10)
     )
@@ -98,14 +102,23 @@ def export_at_root(
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(docs, f, ensure_ascii=False, indent=2)
 
-    link = request.url_for("download_file", filename=filename)
-    headers = {"X-Download-Link": str(link)}
+    download_url = str(request.url_for("download_file", filename=filename))
 
+    if mode == "json":
+        # inline JSON (some tools prefer body instead of file)
+        return JSONResponse(content={"download_url": download_url, "data": docs})
+
+    if mode == "link":
+        # just hand back the link
+        return JSONResponse(content={"download_url": download_url})
+
+    # default: return as a downloadable file with generic content-type
+    # (many “file detector” tools expect application/octet-stream)
     return FileResponse(
         path=str(file_path),
-        media_type="application/json",
+        media_type="application/octet-stream",
         filename=filename,
-        headers=headers,
+        headers={"X-Download-Link": download_url},
     )
 
 @app.get("/download/{filename}")
@@ -113,12 +126,7 @@ def download_file(filename: str):
     file_path = EXPORT_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path=str(file_path), media_type="application/json", filename=filename)
-
-@app.get("/shortcuts")
-def list_shortcuts():
-    items = sorted({k: v for k, v in SHORTCUTS.items()}.items(), key=lambda x: x[0])
-    return {"shortcuts": [{ "key": k, "name": v } for k, v in items]}
+    return FileResponse(path=str(file_path), media_type="application/octet-stream", filename=filename)
 
 @app.get("/health")
 def health():
